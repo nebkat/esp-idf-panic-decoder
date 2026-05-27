@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: 2023 Espressif Systems (Shanghai) CO LTD
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import dataclass
-from typing import List, Optional, Union, Dict, Tuple
+import atexit
 import re
 import subprocess
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Union
 
-from .pc_address_matcher import PcAddressMatcher
 from .output_helpers import red_print
+from .pc_address_matcher import PcAddressMatcher
 
 # regex matches an potential address
 ADDRESS_RE = re.compile(r'0x[0-9a-f]{8}', re.IGNORECASE)
@@ -15,6 +16,15 @@ ADDRESS_RE = re.compile(r'0x[0-9a-f]{8}', re.IGNORECASE)
 ADDR2LINE_ADDRESS_LOOKAHEAD_RE = re.compile(r'(?=0x[0-9a-f]{8}\r?\n)')
 # regex matches filename and line number in addr2line output (and ignores discriminators)
 ADDR2LINE_FILE_LINE_RE = re.compile(r'(?P<file>.*):(?P<line>\d+|\?)(?: \(discriminator \d+\))?$')
+
+# Sentinel written after each request so we know where addr2line's response ends.
+# 0xfefefefe is a classic uninit-memory marker, well outside any ESP code region,
+# so it will not pass PcAddressMatcher.is_executable_address and cannot collide with
+# a real lookup. The regex matches the full 3-line sentinel response atomically
+# (echoed address + ?? + ??:0), tolerating leading zero padding when addr2line widens
+# to the ELF pointer width (e.g. `0x00000000fefefefe` on a 64-bit target).
+ADDR2LINE_SENTINEL_INPUT = '0xfefefefe'
+ADDR2LINE_SENTINEL_RE = re.compile(r'0x0*fefefefe\r?\n\?\?\r?\n\?\?:0\r?\n')
 
 # Decoded PC address trace
 @dataclass
@@ -37,6 +47,61 @@ class PcAddressDecoder:
         self.pc_address_matcher = [PcAddressMatcher(file) for file in self.elf_files]
         if self.rom_elf_file:
             self.pc_address_matcher.append(PcAddressMatcher(self.rom_elf_file))
+
+        # Persistent addr2line subprocesses, keyed by ELF path. addr2line is slow to
+        # start (loads and indexes the ELF) but fast once running, so we keep one
+        # alive per ELF and feed it addresses on stdin.
+        self._processes: Dict[str, subprocess.Popen] = {}
+        atexit.register(self._terminate_all)
+
+    def close(self) -> None:
+        """Terminate any cached addr2line subprocesses. Optional — atexit will handle it otherwise."""
+        self._terminate_all()
+
+    def _spawn(self, elf_file: str) -> Optional[subprocess.Popen]:
+        cmd = [f'{self.toolchain_prefix}addr2line', '-fiaC', '-e', elf_file]
+        try:
+            return subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=1,
+                text=True,
+                cwd='.',
+            )
+        except OSError as err:
+            red_print(f'{" ".join(cmd)}: {err}')
+            return None
+
+    def _get_process(self, elf_file: str) -> Optional[subprocess.Popen]:
+        proc = self._processes.get(elf_file)
+        if proc is not None and proc.poll() is None:
+            return proc
+        # Either no process yet or the previous one exited — (re)spawn.
+        if proc is not None:
+            self._processes.pop(elf_file, None)
+        proc = self._spawn(elf_file)
+        if proc is not None:
+            self._processes[elf_file] = proc
+        return proc
+
+    def _terminate_all(self) -> None:
+        for proc in list(self._processes.values()):
+            try:
+                if proc.stdin and not proc.stdin.closed:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception:
+                pass
+        self._processes.clear()
 
     def decode_address(self, line: bytes) -> str:
         """
@@ -91,49 +156,80 @@ class PcAddressDecoder:
         # === Example input line ===
         # Backtrace: 0x40376121:0x3fcb5590 0x40384ef9:0x3fcb55b0 0x4202c8c9:0x3fcb55d0
         # Each pair represents a program counter (PC) address and a stack pointer (SP) address.
-        # We parse them all and filter out those that are not considered executable by one of the configured ELF files.
+        # We parse them and look them up in the first ELF that owns them.
 
-        # Find all hex addresses (0x40376121, 0x3fcb5590, etc.)
-        addresses = re.findall(ADDRESS_RE, line)
+        addresses = [a.lower() for a in re.findall(ADDRESS_RE, line)]
         if not addresses:
             return []
 
-        # Convert addresses to lowercase to match the case of the addresses in the ELF files
-        addresses = [addr.lower() for addr in addresses]
+        out: List[Tuple[str, List[PcAddressLocation]]] = []
+        for addr in addresses:
+            for matcher in self.pc_address_matcher:
+                if not matcher.is_executable_address(int(addr, 16)):
+                    continue
+                is_rom = matcher.elf_path == self.rom_elf_file
+                trace = self.lookup_address(addr, matcher.elf_path, is_rom=is_rom)
+                if trace is not None:
+                    out.append((addr, trace))
+                    # Stop at the first ELF that owns this address.
+                    break
+        return out
 
-        # Addresses left to find (initially a copy of addresses: 0x40376121, 0x3fcb5590, etc.)
-        remaining = addresses.copy()
+    def lookup_address(
+        self,
+        address: str,
+        elf_file: str,
+        is_rom: bool = False,
+    ) -> Optional[List[PcAddressLocation]]:
+        """
+        Translate one executable address to a source location trace using a persistent addr2line.
+        :param address: The address to translate (e.g. '0x40376121').
+        :param elf_file: The ELF file to use for translating.
+        :param is_rom: If True, replace '??' paths with 'ROM' as paths are not available from ROM ELF files.
+        :return: List of source locations (with multiple indicating an inlined function), or None if
+                 addr2line could not resolve the address (all entries are ??/??).
+        """
+        proc = self._get_process(elf_file)
+        if proc is not None and proc.stdin is not None and proc.stdout is not None:
+            try:
+                # Write address + sentinel; flush so addr2line sees them immediately.
+                proc.stdin.write(f'{address}\n{ADDR2LINE_SENTINEL_INPUT}\n')
+                proc.stdin.flush()
 
-        # Mapped addresses (0x40376121 => [(func, path, line), ...])
-        mapped: Dict[str, List[PcAddressLocation]] = {}
+                # Accumulate lines until the 3-line sentinel response appears.
+                buf = ''
+                while True:
+                    line = proc.stdout.readline()
+                    if line == '':
+                        # EOF — process died.
+                        raise BrokenPipeError('addr2line closed stdout unexpectedly')
+                    buf += line
+                    match = ADDR2LINE_SENTINEL_RE.search(buf)
+                    if match:
+                        # Everything before the sentinel response is the real output for `address`.
+                        return _parse_single_address_output(buf[:match.start()], is_rom=is_rom)
+            except (BrokenPipeError, OSError, RuntimeError) as err:
+                red_print(f'{self.toolchain_prefix}addr2line ({elf_file}): {err}')
+                # Drop the dead process; fall through to one-shot below.
+                self._processes.pop(elf_file, None)
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
-        # Iterate through available ELF files
-        for matcher in self.pc_address_matcher:
-            elf_path = matcher.elf_path
-            is_rom = elf_path == self.rom_elf_file
+        # One-shot fallback (also the path when spawning failed).
+        cmd = [f'{self.toolchain_prefix}addr2line', '-fiaC', '-e', elf_file, address]
+        try:
+            output = subprocess.check_output(cmd, cwd='.')
+        except OSError as err:
+            red_print(f'{" ".join(cmd)}: {err}')
+            return None
+        except subprocess.CalledProcessError as err:
+            red_print(f'{" ".join(cmd)}: {err}')
+            red_print('ELF file is missing or has changed, the build folder was probably modified.')
+            return None
 
-            # Find any remaining addresses that are executable in this ELF file
-            elf_addresses = [addr for addr in remaining if matcher.is_executable_address(int(addr, 16))]
-            if not elf_addresses:
-                continue
-
-            # Translate addresses using addr2line
-            elf_mapped = self.perform_addr2line(addresses=elf_addresses, elf_file=elf_path, is_rom=is_rom)
-
-            # Update shared mapped addresses
-            mapped.update(elf_mapped)
-
-            # Stop searching for addresses that have been found (even if they may exist in other ELF files)
-            remaining = [addr for addr in remaining if addr not in elf_mapped]
-
-            # If there are no remaining addresses, we can stop looking through ELF files
-            if not remaining:
-                break
-
-        # All discovered and translated addresses are now in `mapped`, but they are ordered based on the ELF files.
-        # Recreate the original order of `addresses`, allowing also for multiple instances of the same address.
-        # [(0x40376121, [(func, path, line), ...]), ...]
-        return [(addr, mapped[addr]) for addr in addresses if addr in mapped]
+        return _parse_single_address_output(output.decode(errors='ignore'), is_rom=is_rom)
 
     def perform_addr2line(
         self,
@@ -143,26 +239,18 @@ class PcAddressDecoder:
     ) -> Dict[str, List[PcAddressLocation]]:
         """
         Translate a list of executable addresses to source locations using addr2line.
+        Thin batched wrapper over :py:meth:`lookup_address` — kept for backwards compatibility.
         :param addresses: List of addresses to translate.
-        :param elf_file: The ELF file eto use for translating.
+        :param elf_file: The ELF file to use for translating.
         :param is_rom: If True, replace '??' paths with 'ROM' as paths are not available from ROM ELF files.
-        :return: Map from each address to a list of its source locations (with multiple indicating an inlined function).
+        :return: Map from each resolved address to its trace (unresolved addresses are omitted).
         """
-        cmd = [f'{self.toolchain_prefix}addr2line', '-fiaC', '-e', elf_file, *addresses]
-
-        try:
-            batch_output = subprocess.check_output(cmd, cwd='.')
-        except OSError as err:
-            red_print(f'{" ".join(cmd)}: {err}')
-            return {}
-        except subprocess.CalledProcessError as err:
-            red_print(f'{" ".join(cmd)}: {err}')
-            red_print('ELF file is missing or has changed, the build folder was probably modified.')
-            return {}
-
-        decoded_output = batch_output.decode(errors='ignore')
-
-        return PcAddressDecoder.parse_addr2line_output(decoded_output, is_rom=is_rom)
+        out: Dict[str, List[PcAddressLocation]] = {}
+        for addr in addresses:
+            trace = self.lookup_address(addr, elf_file, is_rom=is_rom)
+            if trace is not None:
+                out[addr] = trace
+        return out
 
     @staticmethod
     def parse_addr2line_output(
@@ -227,3 +315,35 @@ class PcAddressDecoder:
                 result[address] = trace
 
         return result
+
+
+def _parse_single_address_output(
+    output: str,
+    is_rom: bool = False,
+) -> Optional[List[PcAddressLocation]]:
+    """
+    Parse the addr2line output corresponding to a single input address.
+    The first line is the echoed input address (discarded — caller knows what it sent).
+    The remaining lines are (func, file:line) pairs, one per stack frame (1 + inlines).
+    Returns None when the address could not be resolved (every entry is ??/??).
+    """
+    lines = [ln for ln in output.split('\n') if ln != '']
+    if len(lines) < 3:
+        return None
+
+    trace: List[PcAddressLocation] = []
+    valid = False
+    # Skip the echoed address (lines[0]); consume the rest as (func, path_line) pairs.
+    for func, path_line in zip(map(str.strip, lines[1::2]), map(str.strip, lines[2::2])):
+        path_match = ADDR2LINE_FILE_LINE_RE.match(path_line)
+        path = path_match.group('file') if path_match else path_line
+        line = path_match.group('line') if path_match else ''
+
+        valid = valid or func != '??' or path != '??'
+
+        if path == '??' and is_rom:
+            path = 'ROM'
+
+        trace.append(PcAddressLocation(func, path, line))
+
+    return trace if valid and trace else None
