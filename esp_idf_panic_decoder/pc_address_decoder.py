@@ -1,8 +1,11 @@
 # SPDX-FileCopyrightText: 2023 Espressif Systems (Shanghai) CO LTD
 # SPDX-License-Identifier: Apache-2.0
 import atexit
+import os
 import re
+import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -33,6 +36,16 @@ class PcAddressLocation:
     path: str
     line: str
 
+
+# Internal: a live persistent addr2line subprocess for one ELF, plus the state we
+# need to detect when the original ELF has been rewritten and we should respawn.
+@dataclass
+class _Addr2LineProcess:
+    proc: subprocess.Popen
+    temp_path: str
+    mtime: float
+    size: int
+
 class PcAddressDecoder:
     """
     Class for decoding possible addresses
@@ -48,20 +61,58 @@ class PcAddressDecoder:
         if self.rom_elf_file:
             self.pc_address_matcher.append(PcAddressMatcher(self.rom_elf_file))
 
-        # Persistent addr2line subprocesses, keyed by ELF path. addr2line is slow to
-        # start (loads and indexes the ELF) but fast once running, so we keep one
-        # alive per ELF and feed it addresses on stdin.
-        self._processes: Dict[str, subprocess.Popen] = {}
+        # Persistent addr2line subprocesses, keyed by original ELF path. addr2line is
+        # slow to start (loads and indexes the ELF) but fast once running, so we keep
+        # one alive per ELF and feed it addresses on stdin.
+        #
+        # We never point addr2line at the build's actual ELF — we copy it to a temp
+        # location first and addr2line opens the copy. That way the build can rewrite
+        # the original (relevant on Windows, where addr2line's BFD handle can block
+        # the linker; and on Unix, where addr2line would otherwise keep reading the
+        # stale ELF after a rebuild). Before each lookup we stat the original — if
+        # (mtime, size) has changed we tear down the cached process, re-copy, and
+        # respawn so subsequent decodes see fresh symbols.
+        self._processes: Dict[str, _Addr2LineProcess] = {}
+        self._temp_dir: Optional[str] = None
         atexit.register(self._terminate_all)
 
     def close(self) -> None:
         """Terminate any cached addr2line subprocesses. Optional — atexit will handle it otherwise."""
         self._terminate_all()
 
-    def _spawn(self, elf_file: str) -> Optional[subprocess.Popen]:
-        cmd = [f'{self.toolchain_prefix}addr2line', '-fiaC', '-e', elf_file]
+    def _ensure_temp_dir(self) -> str:
+        if self._temp_dir is None:
+            self._temp_dir = tempfile.mkdtemp(prefix='esp-idf-panic-decoder-')
+        return self._temp_dir
+
+    @staticmethod
+    def _elf_stat(elf_file: str) -> Optional[Tuple[float, int]]:
         try:
-            return subprocess.Popen(
+            st = os.stat(elf_file)
+        except OSError:
+            return None
+        return (st.st_mtime, st.st_size)
+
+    def _spawn(self, elf_file: str) -> Optional['_Addr2LineProcess']:
+        stat_info = self._elf_stat(elf_file)
+        if stat_info is None:
+            red_print(f'{elf_file}: file not found')
+            return None
+
+        # Copy the ELF to our temp dir; addr2line opens the copy, not the original.
+        try:
+            temp_dir = self._ensure_temp_dir()
+            base = os.path.basename(elf_file) or 'elf'
+            fd, temp_path = tempfile.mkstemp(prefix=f'{base}.', dir=temp_dir)
+            os.close(fd)
+            shutil.copy2(elf_file, temp_path)
+        except OSError as err:
+            red_print(f'{elf_file}: failed to copy for addr2line: {err}')
+            return None
+
+        cmd = [f'{self.toolchain_prefix}addr2line', '-fiaC', '-e', temp_path]
+        try:
+            proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -72,36 +123,59 @@ class PcAddressDecoder:
             )
         except OSError as err:
             red_print(f'{" ".join(cmd)}: {err}')
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
             return None
 
+        return _Addr2LineProcess(proc=proc, temp_path=temp_path, mtime=stat_info[0], size=stat_info[1])
+
     def _get_process(self, elf_file: str) -> Optional[subprocess.Popen]:
-        proc = self._processes.get(elf_file)
-        if proc is not None and proc.poll() is None:
-            return proc
-        # Either no process yet or the previous one exited — (re)spawn.
-        if proc is not None:
-            self._processes.pop(elf_file, None)
-        proc = self._spawn(elf_file)
-        if proc is not None:
-            self._processes[elf_file] = proc
-        return proc
+        entry = self._processes.get(elf_file)
+        if entry is not None:
+            stat_info = self._elf_stat(elf_file)
+            stale = stat_info is not None and (stat_info[0] != entry.mtime or stat_info[1] != entry.size)
+            died = entry.proc.poll() is not None
+            if stale or died:
+                # Original ELF changed (rebuild) or the process exited — tear down and respawn.
+                self._terminate_entry(entry)
+                self._processes.pop(elf_file, None)
+                entry = None
+        if entry is None:
+            entry = self._spawn(elf_file)
+            if entry is not None:
+                self._processes[elf_file] = entry
+        return entry.proc if entry is not None else None
+
+    @staticmethod
+    def _terminate_entry(entry: '_Addr2LineProcess') -> None:
+        proc = entry.proc
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except Exception:
+            pass
+        try:
+            os.unlink(entry.temp_path)
+        except OSError:
+            pass
 
     def _terminate_all(self) -> None:
-        for proc in list(self._processes.values()):
-            try:
-                if proc.stdin and not proc.stdin.closed:
-                    proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            except Exception:
-                pass
+        for entry in list(self._processes.values()):
+            self._terminate_entry(entry)
         self._processes.clear()
+        if self._temp_dir is not None:
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+            self._temp_dir = None
 
     def decode_address(self, line: bytes) -> str:
         """
@@ -210,12 +284,10 @@ class PcAddressDecoder:
                         return _parse_single_address_output(buf[:match.start()], is_rom=is_rom)
             except (BrokenPipeError, OSError, RuntimeError) as err:
                 red_print(f'{self.toolchain_prefix}addr2line ({elf_file}): {err}')
-                # Drop the dead process; fall through to one-shot below.
-                self._processes.pop(elf_file, None)
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                # Drop the dead process (and its temp copy); fall through to one-shot below.
+                entry = self._processes.pop(elf_file, None)
+                if entry is not None:
+                    self._terminate_entry(entry)
 
         # One-shot fallback (also the path when spawning failed).
         cmd = [f'{self.toolchain_prefix}addr2line', '-fiaC', '-e', elf_file, address]
