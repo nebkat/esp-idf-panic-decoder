@@ -1,15 +1,10 @@
 # SPDX-FileCopyrightText: 2023 Espressif Systems (Shanghai) CO LTD
 # SPDX-License-Identifier: Apache-2.0
-import atexit
-import os
 import re
-import shutil
-import subprocess
-import tempfile
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
-from .output_helpers import red_print
+from .addr2line import Addr2LineRunner
 from .pc_address_matcher import PcAddressMatcher
 
 # regex matches an potential address
@@ -20,14 +15,6 @@ ADDR2LINE_ADDRESS_LOOKAHEAD_RE = re.compile(r'(?=0x[0-9a-f]{8}\r?\n)')
 # regex matches filename and line number in addr2line output (and ignores discriminators)
 ADDR2LINE_FILE_LINE_RE = re.compile(r'(?P<file>.*):(?P<line>\d+|\?)(?: \(discriminator \d+\))?$')
 
-# Sentinel written after each request so we know where addr2line's response ends.
-# 0xfefefefe is a classic uninit-memory marker, well outside any ESP code region,
-# so it will not pass PcAddressMatcher.is_executable_address and cannot collide with
-# a real lookup. The regex matches the full 3-line sentinel response atomically
-# (echoed address + ?? + ??:0), tolerating leading zero padding when addr2line widens
-# to the ELF pointer width (e.g. `0x00000000fefefefe` on a 64-bit target).
-ADDR2LINE_SENTINEL_INPUT = '0xfefefefe'
-ADDR2LINE_SENTINEL_RE = re.compile(r'0x0*fefefefe\r?\n\?\?\r?\n\?\?:0\r?\n')
 
 # Decoded PC address trace
 @dataclass
@@ -36,15 +23,6 @@ class PcAddressLocation:
     path: str
     line: str
 
-
-# Internal: a live persistent addr2line subprocess for one ELF, plus the state we
-# need to detect when the original ELF has been rewritten and we should respawn.
-@dataclass
-class _Addr2LineProcess:
-    proc: subprocess.Popen
-    temp_path: str
-    mtime: float
-    size: int
 
 class PcAddressDecoder:
     """
@@ -61,121 +39,11 @@ class PcAddressDecoder:
         if self.rom_elf_file:
             self.pc_address_matcher.append(PcAddressMatcher(self.rom_elf_file))
 
-        # Persistent addr2line subprocesses, keyed by original ELF path. addr2line is
-        # slow to start (loads and indexes the ELF) but fast once running, so we keep
-        # one alive per ELF and feed it addresses on stdin.
-        #
-        # We never point addr2line at the build's actual ELF — we copy it to a temp
-        # location first and addr2line opens the copy. That way the build can rewrite
-        # the original (relevant on Windows, where addr2line's BFD handle can block
-        # the linker; and on Unix, where addr2line would otherwise keep reading the
-        # stale ELF after a rebuild). Before each lookup we stat the original — if
-        # (mtime, size) has changed we tear down the cached process, re-copy, and
-        # respawn so subsequent decodes see fresh symbols.
-        self._processes: Dict[str, _Addr2LineProcess] = {}
-        self._temp_dir: Optional[str] = None
-        atexit.register(self._terminate_all)
+        self._addr2line = Addr2LineRunner(toolchain_prefix)
 
     def close(self) -> None:
         """Terminate any cached addr2line subprocesses. Optional — atexit will handle it otherwise."""
-        self._terminate_all()
-
-    def _ensure_temp_dir(self) -> str:
-        if self._temp_dir is None:
-            self._temp_dir = tempfile.mkdtemp(prefix='esp-idf-panic-decoder-')
-        return self._temp_dir
-
-    @staticmethod
-    def _elf_stat(elf_file: str) -> Optional[Tuple[float, int]]:
-        try:
-            st = os.stat(elf_file)
-        except OSError:
-            return None
-        return (st.st_mtime, st.st_size)
-
-    def _spawn(self, elf_file: str) -> Optional['_Addr2LineProcess']:
-        stat_info = self._elf_stat(elf_file)
-        if stat_info is None:
-            red_print(f'{elf_file}: file not found')
-            return None
-
-        # Copy the ELF to our temp dir; addr2line opens the copy, not the original.
-        try:
-            temp_dir = self._ensure_temp_dir()
-            base = os.path.basename(elf_file) or 'elf'
-            fd, temp_path = tempfile.mkstemp(prefix=f'{base}.', dir=temp_dir)
-            os.close(fd)
-            shutil.copy2(elf_file, temp_path)
-        except OSError as err:
-            red_print(f'{elf_file}: failed to copy for addr2line: {err}')
-            return None
-
-        cmd = [f'{self.toolchain_prefix}addr2line', '-fiaC', '-e', temp_path]
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=1,
-                text=True,
-                cwd='.',
-            )
-        except OSError as err:
-            red_print(f'{" ".join(cmd)}: {err}')
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            return None
-
-        return _Addr2LineProcess(proc=proc, temp_path=temp_path, mtime=stat_info[0], size=stat_info[1])
-
-    def _get_process(self, elf_file: str) -> Optional[subprocess.Popen]:
-        entry = self._processes.get(elf_file)
-        if entry is not None:
-            stat_info = self._elf_stat(elf_file)
-            stale = stat_info is not None and (stat_info[0] != entry.mtime or stat_info[1] != entry.size)
-            died = entry.proc.poll() is not None
-            if stale or died:
-                # Original ELF changed (rebuild) or the process exited — tear down and respawn.
-                self._terminate_entry(entry)
-                self._processes.pop(elf_file, None)
-                entry = None
-        if entry is None:
-            entry = self._spawn(elf_file)
-            if entry is not None:
-                self._processes[elf_file] = entry
-        return entry.proc if entry is not None else None
-
-    @staticmethod
-    def _terminate_entry(entry: '_Addr2LineProcess') -> None:
-        proc = entry.proc
-        try:
-            if proc.stdin and not proc.stdin.closed:
-                proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            proc.terminate()
-            try:
-                proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        except Exception:
-            pass
-        try:
-            os.unlink(entry.temp_path)
-        except OSError:
-            pass
-
-    def _terminate_all(self) -> None:
-        for entry in list(self._processes.values()):
-            self._terminate_entry(entry)
-        self._processes.clear()
-        if self._temp_dir is not None:
-            shutil.rmtree(self._temp_dir, ignore_errors=True)
-            self._temp_dir = None
+        self._addr2line.close()
 
     def decode_address(self, line: bytes) -> str:
         """
@@ -263,45 +131,13 @@ class PcAddressDecoder:
         :return: List of source locations (with multiple indicating an inlined function), or None if
                  addr2line could not resolve the address (all entries are ??/??).
         """
-        proc = self._get_process(elf_file)
-        if proc is not None and proc.stdin is not None and proc.stdout is not None:
-            try:
-                # Write address + sentinel; flush so addr2line sees them immediately.
-                proc.stdin.write(f'{address}\n{ADDR2LINE_SENTINEL_INPUT}\n')
-                proc.stdin.flush()
-
-                # Accumulate lines until the 3-line sentinel response appears.
-                buf = ''
-                while True:
-                    line = proc.stdout.readline()
-                    if line == '':
-                        # EOF — process died.
-                        raise BrokenPipeError('addr2line closed stdout unexpectedly')
-                    buf += line
-                    match = ADDR2LINE_SENTINEL_RE.search(buf)
-                    if match:
-                        # Everything before the sentinel response is the real output for `address`.
-                        return _parse_single_address_output(buf[:match.start()], is_rom=is_rom)
-            except (BrokenPipeError, OSError, RuntimeError) as err:
-                red_print(f'{self.toolchain_prefix}addr2line ({elf_file}): {err}')
-                # Drop the dead process (and its temp copy); fall through to one-shot below.
-                entry = self._processes.pop(elf_file, None)
-                if entry is not None:
-                    self._terminate_entry(entry)
-
-        # One-shot fallback (also the path when spawning failed).
-        cmd = [f'{self.toolchain_prefix}addr2line', '-fiaC', '-e', elf_file, address]
-        try:
-            output = subprocess.check_output(cmd, cwd='.')
-        except OSError as err:
-            red_print(f'{" ".join(cmd)}: {err}')
+        frames = self._addr2line.lookup(address, elf_file)
+        if frames is None:
             return None
-        except subprocess.CalledProcessError as err:
-            red_print(f'{" ".join(cmd)}: {err}')
-            red_print('ELF file is missing or has changed, the build folder was probably modified.')
-            return None
-
-        return _parse_single_address_output(output.decode(errors='ignore'), is_rom=is_rom)
+        return [
+            PcAddressLocation(func, 'ROM' if is_rom and path == '??' else path, line)
+            for func, path, line in frames
+        ]
 
     def perform_addr2line(
         self,
@@ -387,35 +223,3 @@ class PcAddressDecoder:
                 result[address] = trace
 
         return result
-
-
-def _parse_single_address_output(
-    output: str,
-    is_rom: bool = False,
-) -> Optional[List[PcAddressLocation]]:
-    """
-    Parse the addr2line output corresponding to a single input address.
-    The first line is the echoed input address (discarded — caller knows what it sent).
-    The remaining lines are (func, file:line) pairs, one per stack frame (1 + inlines).
-    Returns None when the address could not be resolved (every entry is ??/??).
-    """
-    lines = [ln for ln in output.split('\n') if ln != '']
-    if len(lines) < 3:
-        return None
-
-    trace: List[PcAddressLocation] = []
-    valid = False
-    # Skip the echoed address (lines[0]); consume the rest as (func, path_line) pairs.
-    for func, path_line in zip(map(str.strip, lines[1::2]), map(str.strip, lines[2::2])):
-        path_match = ADDR2LINE_FILE_LINE_RE.match(path_line)
-        path = path_match.group('file') if path_match else path_line
-        line = path_match.group('line') if path_match else ''
-
-        valid = valid or func != '??' or path != '??'
-
-        if path == '??' and is_rom:
-            path = 'ROM'
-
-        trace.append(PcAddressLocation(func, path, line))
-
-    return trace if valid and trace else None
